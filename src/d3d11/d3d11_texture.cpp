@@ -3,10 +3,71 @@
 #include "d3d11_gdi.h"
 #include "d3d11_texture.h"
 
+#include "../util/util_env.h"
 #include "../util/util_shared_res.h"
 #include "../util/util_win32_compat.h"
 
 namespace dxvk {
+
+  namespace {
+
+    /**
+     * \brief XRGame memory reductions
+     *
+     * Read once from XRGAME_TEXTURE_QUALITY and XRGAME_RENDER_SCALE. The
+     * mip cap is the largest level, by its longer side, that images keep.
+     * A fixed cap rather than a per-texture drop keeps equal-sized levels
+     * of different textures in step, so copies between them (texture
+     * streaming) find both levels or neither.
+     */
+    struct XrGameQualityConfig {
+      uint32_t mipCap      = 0u;
+      uint32_t renderScale = 100u;
+    };
+
+    const XrGameQualityConfig& GetXrGameQualityConfig() {
+      static const XrGameQualityConfig s_config = [] {
+        XrGameQualityConfig config;
+        std::string quality = env::getEnvVar("XRGAME_TEXTURE_QUALITY");
+        std::string scale = env::getEnvVar("XRGAME_RENDER_SCALE");
+
+        if (quality == "medium")
+          config.mipCap = 1024u;
+        else if (quality == "low")
+          config.mipCap = 512u;
+        else
+          quality = "high";
+
+        if (scale == "75")
+          config.renderScale = 75u;
+        else if (scale == "50")
+          config.renderScale = 50u;
+
+        Logger::info(str::format("XRGame texture quality ", quality,
+          ", shadow render scale ", config.renderScale, "%"));
+        return config;
+      }();
+
+      return s_config;
+    }
+
+
+    VkDeviceSize XrGameImageSize(
+            VkFormat              Format,
+            VkImageAspectFlags    Aspects,
+            VkExtent3D            Extent,
+            uint32_t              Levels,
+            uint32_t              Layers) {
+      VkDeviceSize size = 0u;
+
+      for (uint32_t i = 0; i < Levels; i++)
+        size += util::computeImageDataSize(Format, util::computeMipLevelExtent(Extent, i), Aspects);
+
+      return size * Layers;
+    }
+
+  }
+
   
   D3D11CommonTexture::D3D11CommonTexture(
           ID3D11Resource*             pInterface,
@@ -210,6 +271,18 @@ namespace dxvk {
           CreateMappedBuffer(i);
       }
     }
+
+    // XRGame memory reductions. Only device-local images that the application
+    // can neither map nor share, and whose tiling it cannot query, qualify.
+    if (m_mapMode == D3D11_COMMON_TEXTURE_MAP_MODE_NONE
+     && Dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D
+     && !vkImage && !m_11on12.Resource && !DxgiUsage
+     && hSharedHandle == INVALID_HANDLE_VALUE
+     && !(m_desc.MiscFlags & (sharingFlags | D3D11_RESOURCE_MISC_TILED
+                            | D3D11_RESOURCE_MISC_GDI_COMPATIBLE | D3D11_RESOURCE_MISC_GENERATE_MIPS))
+     && m_desc.SampleDesc.Count == 1 && !m_desc.CPUAccessFlags && !isMultiPlane
+     && m_desc.TextureLayout == D3D11_TEXTURE_LAYOUT_UNDEFINED)
+      XrGameReduce(imageInfo, formatProperties->aspectMask);
 
     // Skip image creation if possible
     if (m_mapMode == D3D11_COMMON_TEXTURE_MAP_MODE_STAGING)
@@ -511,6 +584,71 @@ namespace dxvk {
     }
 
     return S_OK;
+  }
+
+
+  void D3D11CommonTexture::XrGameReduce(
+          DxvkImageCreateInfo&  ImageInfo,
+          VkImageAspectFlags    Aspects) {
+    static std::atomic<uint32_t> s_count[2] = { };
+    static std::atomic<uint64_t> s_saved[2] = { };
+
+    const auto& config = GetXrGameQualityConfig();
+    uint32_t levels = m_desc.MipLevels;
+    uint32_t bind = m_desc.BindFlags;
+
+    // Texture quality: sampled-only textures with mipmaps.
+    if (config.mipCap && Aspects == VK_IMAGE_ASPECT_COLOR_BIT && levels >= 2
+     && (bind & D3D11_BIND_SHADER_RESOURCE)
+     && !(bind & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_UNORDERED_ACCESS))) {
+      uint32_t size = std::max(m_desc.Width, m_desc.Height);
+
+      while (m_xrgameMipDrop + 1u < levels && (size >> m_xrgameMipDrop) > config.mipCap)
+        m_xrgameMipDrop += 1u;
+
+      if (m_xrgameMipDrop) {
+        ImageInfo.extent.width  = std::max(1u, m_desc.Width  >> m_xrgameMipDrop);
+        ImageInfo.extent.height = std::max(1u, m_desc.Height >> m_xrgameMipDrop);
+        ImageInfo.mipLevels    -= m_xrgameMipDrop;
+      }
+    }
+
+    // Shadow render scale: large depth arrays. Single large square maps are
+    // left alone; in Half-Life: Alyx they were also bound with full-size render
+    // targets. The main depth buffer matches the swapchain and is not an array.
+    if (config.renderScale < 100u && levels == 1u
+     && (bind & D3D11_BIND_DEPTH_STENCIL)
+     && !(bind & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS))) {
+      uint32_t shortSide = std::min(m_desc.Width, m_desc.Height);
+
+      if (m_desc.ArraySize > 1u && shortSide >= 1024u) {
+        m_xrgameScale = config.renderScale;
+        ImageInfo.extent.width  = XrGameScaleEnd(m_desc.Width,  m_xrgameScale);
+        ImageInfo.extent.height = XrGameScaleEnd(m_desc.Height, m_xrgameScale);
+      }
+    }
+
+    if (!m_xrgameMipDrop && !m_xrgameScale)
+      return;
+
+    VkDeviceSize full = XrGameImageSize(ImageInfo.format, Aspects,
+      VkExtent3D { m_desc.Width, m_desc.Height, 1u }, levels, m_desc.ArraySize);
+    VkDeviceSize reduced = XrGameImageSize(ImageInfo.format, Aspects,
+      ImageInfo.extent, ImageInfo.mipLevels, m_desc.ArraySize);
+    uint32_t kind = m_xrgameScale ? 1u : 0u;
+    uint32_t count = ++s_count[kind];
+    uint64_t saved = (s_saved[kind] += full - reduced);
+
+    if (kind) {
+      Logger::info(str::format("XRGame render scale ", m_xrgameScale, "%: depth image ",
+        m_desc.Width, "x", m_desc.Height, "x", m_desc.ArraySize, " -> ",
+        ImageInfo.extent.width, "x", ImageInfo.extent.height, ", ", count, " images, ",
+        saved >> 20, " MiB saved"));
+    } else if (count == 1u || !(count % 64u)) {
+      Logger::info(str::format("XRGame texture quality: ", count, " textures reduced, ",
+        saved >> 20, " MiB saved (latest ", m_desc.Width, "x", m_desc.Height, ", ",
+        ImageInfo.mipLevels, " of ", levels, " levels kept)"));
+    }
   }
 
 

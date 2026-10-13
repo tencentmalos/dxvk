@@ -64,6 +64,14 @@ namespace dxvk {
       return m_desc.Format;
     }
 
+    /**
+     * \brief XRGame render scale of the depth image in percent
+     * \returns The scale, or 0 if the image is not scaled
+     */
+    uint32_t XrGameScalePercent() const {
+      return m_xrgameScale;
+    }
+
     D3D10DepthStencilView* GetD3D10Iface() {
       return &m_d3d10;
     }
@@ -83,6 +91,8 @@ namespace dxvk {
     D3D11_VK_VIEW_INFO                m_info;
     Rc<DxvkImageView>                 m_view;
     D3D10DepthStencilView             m_d3d10;
+
+    uint32_t                          m_xrgameScale = 0u;
 
     D3DDestructionNotifier            m_destructionNotifier;
 

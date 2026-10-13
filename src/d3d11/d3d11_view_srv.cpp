@@ -176,6 +176,25 @@ namespace dxvk {
       m_info.Image.NumLevels = viewInfo.mipCount;
       m_info.Image.NumLayers = viewInfo.layerCount;
 
+      // XRGame texture quality: the image may leave out the top mip levels.
+      // A view of left-out levels only reads the largest level the image keeps.
+      if (texture->XrGameMipDrop()) {
+        uint32_t drop  = texture->XrGameMipDrop();
+        uint32_t first = viewInfo.mipIndex;
+        uint32_t end   = first + viewInfo.mipCount;
+
+        first = first > drop ? first - drop : 0u;
+        end   = end   > drop ? end   - drop : 0u;
+
+        if (end <= first) {
+          first = 0u;
+          end   = 1u;
+        }
+
+        viewInfo.mipIndex = first;
+        viewInfo.mipCount = end - first;
+      }
+
       // Create the underlying image view object
       m_imageView = texture->GetImage()->createView(viewInfo);
     }

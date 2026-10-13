@@ -55,6 +55,21 @@ namespace dxvk {
 
 
   /**
+   * \brief XRGame render scale helpers
+   *
+   * Start coordinates round down and end coordinates round up, so a
+   * full-size region covers the whole scaled image.
+   */
+  inline uint32_t XrGameScaleStart(uint32_t Value, uint32_t Percent) {
+    return uint32_t((uint64_t(Value) * Percent) / 100u);
+  }
+
+  inline uint32_t XrGameScaleEnd(uint32_t Value, uint32_t Percent) {
+    return uint32_t((uint64_t(Value) * Percent + 99u) / 100u);
+  }
+
+
+  /**
    * \brief Packed subresource layout
    */
   struct D3D11_COMMON_TEXTURE_SUBRESOURCE_LAYOUT {
@@ -146,6 +161,40 @@ namespace dxvk {
     VkExtent3D MipLevelExtent(uint32_t Level) const {
       return util::computeMipLevelExtent(
         VkExtent3D { m_desc.Width, m_desc.Height, m_desc.Depth }, Level);
+    }
+
+    /**
+     * \brief XRGame texture quality: top mip levels the image leaves out
+     *
+     * D3D11 mip N is image mip N - XrGameMipDrop(). The application keeps
+     * seeing its own description; only the image is smaller.
+     */
+    uint32_t XrGameMipDrop() const {
+      return m_xrgameMipDrop;
+    }
+
+    /**
+     * \brief XRGame render scale of shadow-like depth images
+     * \returns The scale in percent, or 0 if the image is not scaled
+     */
+    uint32_t XrGameScalePercent() const {
+      return m_xrgameScale;
+    }
+
+    bool XrGameReduced() const {
+      return m_xrgameMipDrop || m_xrgameScale;
+    }
+
+    /**
+     * \brief Maps a D3D11 mip level to the image
+     * \returns \c false if the image leaves the level out
+     */
+    bool XrGameMapMip(uint32_t& Level) const {
+      if (Level < m_xrgameMipDrop)
+        return false;
+
+      Level -= m_xrgameMipDrop;
+      return true;
     }
 
     /**
@@ -587,6 +636,13 @@ namespace dxvk {
     small_vector<MappedInfo, 6>   m_mapInfo;
 
     void*                         m_mapPtr = nullptr;
+
+    uint32_t                      m_xrgameMipDrop = 0u;
+    uint32_t                      m_xrgameScale = 0u;
+
+    void XrGameReduce(
+            DxvkImageCreateInfo&  ImageInfo,
+            VkImageAspectFlags    Aspects);
 
     void CreateMappedBuffer(
             UINT                  Subresource);

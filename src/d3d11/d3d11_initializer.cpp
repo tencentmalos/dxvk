@@ -164,6 +164,12 @@ namespace dxvk {
     VkFormat packedFormat = m_parent->LookupPackedFormat(desc->Format, pTexture->GetFormatMode()).Format;
     auto formatInfo = lookupFormatInfo(packedFormat);
 
+    // XRGame: a scaled depth image cannot take the application's full-size data.
+    if (pTexture->XrGameScalePercent() && pInitialData != nullptr && pInitialData->pSysMem != nullptr) {
+      Logger::warn("XRGame: initial data of a scaled depth image is dropped");
+      pInitialData = nullptr;
+    }
+
     if (pInitialData != nullptr && pInitialData->pSysMem != nullptr) {
       // Compute data size for all subresources and allocate staging buffer memory
       DxvkBufferSlice stagingSlice;
@@ -188,9 +194,12 @@ namespace dxvk {
           uint32_t index = D3D11CalcSubresource(mip, layer, desc->MipLevels);
           VkExtent3D mipLevelExtent = pTexture->MipLevelExtent(mip);
 
-          if (pTexture->HasImage()) {
+          // XRGame texture quality: levels the image leaves out are not uploaded.
+          uint32_t imageMip = mip;
+
+          if (pTexture->HasImage() && pTexture->XrGameMapMip(imageMip)) {
             VkDeviceSize mipSizePerLayer = util::computeImageDataSize(
-              packedFormat, image->mipLevelExtent(mip), formatInfo->aspectMask);
+              packedFormat, image->mipLevelExtent(imageMip), formatInfo->aspectMask);
 
             m_transferCommands += 1;
 
