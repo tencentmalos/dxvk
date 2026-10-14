@@ -205,7 +205,7 @@ namespace dxvk {
     UINT  minUav         = D3D11_1_UAV_SLOT_COUNT;
     UINT  maxUav         = 0u;
 
-    /// XRGame render scale of the bound depth target, 0 if not scaled
+    /// XRGame render scale of the bound render targets in eighths, 0 if not scaled
     UINT  xrgameScale    = 0u;
 
     void reset() {

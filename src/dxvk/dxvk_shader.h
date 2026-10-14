@@ -29,11 +29,16 @@ namespace dxvk {
     static constexpr uint32_t MaxTessFactorOffset = SampleCountOffset + SampleCountBits;
     static constexpr uint32_t MaxTessFactorBits = 8u;
 
+    /// XRGame render scale of the bound render targets in eighths, 0 if not scaled
+    static constexpr uint32_t RenderScaleOffset = MaxTessFactorOffset + MaxTessFactorBits;
+    static constexpr uint32_t RenderScaleBits = 4u;
+
     DxvkBuiltInPushData() = default;
 
-    explicit DxvkBuiltInPushData(uint32_t sampleCount, uint32_t maxTessFactor)
+    explicit DxvkBuiltInPushData(uint32_t sampleCount, uint32_t maxTessFactor, uint32_t renderScale = 0u)
     : builtIns((sampleCount   << SampleCountOffset)
-             | (maxTessFactor << MaxTessFactorOffset)) { }
+             | (maxTessFactor << MaxTessFactorOffset)
+             | (renderScale   << RenderScaleOffset)) { }
 
     uint32_t builtIns = 0u;
   };

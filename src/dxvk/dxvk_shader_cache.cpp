@@ -186,7 +186,7 @@ namespace dxvk {
 
     LutHeader header = { };
     header.magic = { 'D', 'X', 'V', 'K' };
-    header.versionString = DXVK_VERSION;
+    header.versionString = std::string(DXVK_VERSION) + DxvkXrGameRenderScale::get().cacheSuffix;
 
     if (!writeHeader(m_lutFile, header)) {
       Logger::warn(str::format("Failed to write cache header: ", path + m_filePaths.lutFile));
@@ -209,9 +209,12 @@ namespace dxvk {
       return false;
     }
 
-    if (header.versionString != DXVK_VERSION) {
+    // XRGame: shaders lowered with the render scale rewrite get their own cache version
+    std::string versionString = std::string(DXVK_VERSION) + DxvkXrGameRenderScale::get().cacheSuffix;
+
+    if (header.versionString != versionString) {
       Logger::warn(str::format("Cache was created with DXVK version ", header.versionString,
-        ", but current version is ", DXVK_VERSION, ". Discarding old cache."));
+        ", but current version is ", versionString, ". Discarding old cache."));
       return false;
     }
 

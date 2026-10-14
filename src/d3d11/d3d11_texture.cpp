@@ -22,7 +22,7 @@ namespace dxvk {
      */
     struct XrGameQualityConfig {
       uint32_t mipCap      = 0u;
-      uint32_t renderScale = 100u;
+      uint32_t renderScale = 8u;
     };
 
     const XrGameQualityConfig& GetXrGameQualityConfig() {
@@ -38,13 +38,18 @@ namespace dxvk {
         else
           quality = "high";
 
+        // The steps of shadPS4's internal scale, in eighths
         if (scale == "75")
-          config.renderScale = 75u;
+          config.renderScale = 6u;
         else if (scale == "50")
-          config.renderScale = 50u;
+          config.renderScale = 4u;
+        else if (scale == "37.5")
+          config.renderScale = 3u;
+        else if (scale == "25")
+          config.renderScale = 2u;
 
         Logger::info(str::format("XRGame texture quality ", quality,
-          ", shadow render scale ", config.renderScale, "%"));
+          ", render scale ", config.renderScale, "/8"));
         return config;
       }();
 
@@ -274,9 +279,13 @@ namespace dxvk {
 
     // XRGame memory reductions. Only device-local images that the application
     // can neither map nor share, and whose tiling it cannot query, qualify.
+    // Swapchain back buffers do (presentation stretches them), GDI ones do not.
+    constexpr DXGI_USAGE xrgameBackBufferUsage = DXGI_USAGE_BACK_BUFFER
+      | DXGI_USAGE_DISCARD_ON_PRESENT | DXGI_USAGE_READ_ONLY;
+
     if (m_mapMode == D3D11_COMMON_TEXTURE_MAP_MODE_NONE
      && Dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D
-     && !vkImage && !m_11on12.Resource && !DxgiUsage
+     && !vkImage && !m_11on12.Resource && !(DxgiUsage & ~xrgameBackBufferUsage)
      && hSharedHandle == INVALID_HANDLE_VALUE
      && !(m_desc.MiscFlags & (sharingFlags | D3D11_RESOURCE_MISC_TILED
                             | D3D11_RESOURCE_MISC_GDI_COMPATIBLE | D3D11_RESOURCE_MISC_GENERATE_MIPS))
@@ -613,18 +622,20 @@ namespace dxvk {
       }
     }
 
-    // Shadow render scale: large depth arrays. Single large square maps are
-    // left alone; in Half-Life: Alyx they were also bound with full-size render
-    // targets. The main depth buffer matches the swapchain and is not an array.
-    if (config.renderScale < 100u && levels == 1u
-     && (bind & D3D11_BIND_DEPTH_STENCIL)
-     && !(bind & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS))) {
-      uint32_t shortSide = std::min(m_desc.Width, m_desc.Height);
+    // Render scale, as shadPS4's internal scale: render and depth targets whose
+    // shorter side is above 64 texels. Shaders map texel coordinates and size
+    // queries of these images, and SV_Position while rendering into them. The
+    // D3D11 mip chain has to fit the smaller image.
+    if (config.renderScale < 8u && (bind & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL))
+     && std::min(m_desc.Width, m_desc.Height) > 64u) {
+      uint32_t width  = XrGameScaleExtent(m_desc.Width,  config.renderScale);
+      uint32_t height = XrGameScaleExtent(m_desc.Height, config.renderScale);
 
-      if (m_desc.ArraySize > 1u && shortSide >= 1024u) {
+      if (levels <= 32u - bit::lzcnt(std::max(width, height))) {
         m_xrgameScale = config.renderScale;
-        ImageInfo.extent.width  = XrGameScaleEnd(m_desc.Width,  m_xrgameScale);
-        ImageInfo.extent.height = XrGameScaleEnd(m_desc.Height, m_xrgameScale);
+        ImageInfo.extent.width  = width;
+        ImageInfo.extent.height = height;
+        ImageInfo.xrgameRequestedExtent = VkExtent2D { m_desc.Width, m_desc.Height };
       }
     }
 
@@ -640,10 +651,13 @@ namespace dxvk {
     uint64_t saved = (s_saved[kind] += full - reduced);
 
     if (kind) {
-      Logger::info(str::format("XRGame render scale ", m_xrgameScale, "%: depth image ",
-        m_desc.Width, "x", m_desc.Height, "x", m_desc.ArraySize, " -> ",
-        ImageInfo.extent.width, "x", ImageInfo.extent.height, ", ", count, " images, ",
-        saved >> 20, " MiB saved"));
+      if (count <= 16u || !(count % 64u)) {
+        Logger::info(str::format("XRGame render scale ", m_xrgameScale, "/8: ", count,
+          " targets scaled, ", saved >> 20, " MiB saved (latest ",
+          (Aspects & VK_IMAGE_ASPECT_COLOR_BIT) ? "color " : "depth ",
+          m_desc.Width, "x", m_desc.Height, "x", m_desc.ArraySize, " -> ",
+          ImageInfo.extent.width, "x", ImageInfo.extent.height, ")"));
+      }
     } else if (count == 1u || !(count % 64u)) {
       Logger::info(str::format("XRGame texture quality: ", count, " textures reduced, ",
         saved >> 20, " MiB saved (latest ", m_desc.Width, "x", m_desc.Height, ", ",

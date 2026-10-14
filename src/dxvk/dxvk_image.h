@@ -77,6 +77,10 @@ namespace dxvk {
 
     // Debug name
     const char* debugName = nullptr;
+
+    // XRGame render scale: the size the application created the image with
+    // when the image itself is smaller, zero otherwise
+    VkExtent2D xrgameRequestedExtent = { 0u, 0u };
   };
   
   

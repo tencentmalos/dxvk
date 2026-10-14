@@ -448,6 +448,11 @@ namespace dxvk {
         case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
           return sizeof(VkDeviceAddress);
 
+        // XRGame render scale tag of an image: requested width | height << 16
+        case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+        case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+          return sizeof(uint32_t);
+
         default:
           return 0u;
       }

@@ -57,15 +57,37 @@ namespace dxvk {
   /**
    * \brief XRGame render scale helpers
    *
-   * Start coordinates round down and end coordinates round up, so a
-   * full-size region covers the whole scaled image.
+   * The scale is in eighths, as shadPS4's internal scale. Scaled images are
+   * max(1, size * eighths / 8) texels long. Start coordinates round down and
+   * end coordinates round up, so a full-size region covers the whole image.
    */
-  inline uint32_t XrGameScaleStart(uint32_t Value, uint32_t Percent) {
-    return uint32_t((uint64_t(Value) * Percent) / 100u);
+  inline uint32_t XrGameScaleExtent(uint32_t Value, uint32_t Eighths) {
+    return std::max(1u, uint32_t((uint64_t(Value) * Eighths) / 8u));
   }
 
-  inline uint32_t XrGameScaleEnd(uint32_t Value, uint32_t Percent) {
-    return uint32_t((uint64_t(Value) * Percent + 99u) / 100u);
+  inline uint32_t XrGameScaleStart(uint32_t Value, uint32_t Eighths) {
+    return uint32_t((uint64_t(Value) * Eighths) / 8u);
+  }
+
+  inline uint32_t XrGameScaleEnd(uint32_t Value, uint32_t Eighths) {
+    return uint32_t((uint64_t(Value) * Eighths + 7u) / 8u);
+  }
+
+  /**
+   * \brief Size of mip 0 of a view as the application created it
+   *
+   * Differs from the view's extent when the render scale reduced the image.
+   */
+  inline VkExtent3D XrGameAppExtent(const Rc<DxvkImageView>& View) {
+    VkExtent3D extent = View->mipLevelExtent(0);
+    VkExtent2D requested = View->image()->info().xrgameRequestedExtent;
+
+    if (unlikely(requested.width)) {
+      extent.width  = std::max(1u, requested.width  >> View->info().mipIndex);
+      extent.height = std::max(1u, requested.height >> View->info().mipIndex);
+    }
+
+    return extent;
   }
 
 
@@ -177,7 +199,7 @@ namespace dxvk {
      * \brief XRGame render scale of shadow-like depth images
      * \returns The scale in percent, or 0 if the image is not scaled
      */
-    uint32_t XrGameScalePercent() const {
+    uint32_t XrGameScaleEighths() const {
       return m_xrgameScale;
     }
 

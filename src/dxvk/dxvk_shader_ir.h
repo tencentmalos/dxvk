@@ -17,6 +17,29 @@
 namespace dxvk {
 
   /**
+   * \brief XRGame render scale settings for shader lowering
+   *
+   * Read once from XRGAME_RENDER_SCALE. Shaders only get the render scale
+   * rewrite while the scale is below 100%. XRGAME_RENDER_SCALE_DEBUG bits
+   * leave parts out for diagnosis: 1 all of it, 2 SV_Position, 4 texel
+   * coordinates of loads, stores and atomics, 8 size queries.
+   */
+  struct DxvkXrGameRenderScale {
+    bool fragCoord    = false;
+    bool texelMapping = false;
+    bool sizeQuery    = false;
+
+    /// Suffix of the shader cache version, empty while shaders are unchanged
+    std::string cacheSuffix;
+
+    bool images() const {
+      return texelMapping || sizeQuery;
+    }
+
+    static const DxvkXrGameRenderScale& get();
+  };
+
+  /**
    * \brief IR shader properties
    *
    * Stores some metadata that cannot be inferred from

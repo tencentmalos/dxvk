@@ -65,10 +65,10 @@ namespace dxvk {
     }
 
     /**
-     * \brief XRGame render scale of the depth image in percent
+     * \brief XRGame render scale of the depth image in eighths
      * \returns The scale, or 0 if the image is not scaled
      */
-    uint32_t XrGameScalePercent() const {
+    uint32_t XrGameScaleEighths() const {
       return m_xrgameScale;
     }
 

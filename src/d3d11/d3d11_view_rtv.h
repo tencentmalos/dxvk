@@ -51,6 +51,14 @@ namespace dxvk {
       return m_view;
     }
     
+    /**
+     * \brief XRGame render scale of the image in eighths
+     * \returns The scale, or 0 if the image is not scaled
+     */
+    uint32_t XrGameScaleEighths() const {
+      return m_xrgameScale;
+    }
+
     UINT GetSampleCount() const {
       return UINT(m_view->image()->info().sampleCount);
     }
@@ -80,6 +88,8 @@ namespace dxvk {
     D3D11_RENDER_TARGET_VIEW_DESC1    m_desc;
     D3D11_VK_VIEW_INFO                m_info;
     Rc<DxvkImageView>                 m_view;
+
+    uint32_t                          m_xrgameScale = 0u;
     D3D10RenderTargetView             m_d3d10;
 
     D3DDestructionNotifier            m_destructionNotifier;

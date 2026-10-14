@@ -960,6 +960,15 @@ namespace dxvk {
             VkOffset3D                        SrcOffset,
             VkExtent3D                        SrcExtent);
 
+    bool XrGameBlitImage(
+            D3D11CommonTexture*               pDstTexture,
+      const VkImageSubresourceLayers*         pDstLayers,
+            VkOffset3D                        DstOffset,
+            D3D11CommonTexture*               pSrcTexture,
+      const VkImageSubresourceLayers*         pSrcLayers,
+            VkOffset3D                        SrcOffset,
+            VkExtent3D                        SrcExtent);
+
     void CopyTiledResourceData(
             ID3D11Resource*                   pResource,
       const D3D11_TILED_RESOURCE_COORDINATE*  pRegionCoordinate,

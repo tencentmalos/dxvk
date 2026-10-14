@@ -115,6 +115,7 @@ namespace dxvk {
     
     // Create the underlying image view object
     m_view = texture->GetImage()->createView(viewInfo);
+    m_xrgameScale = texture->XrGameScaleEighths();
   }
   
   

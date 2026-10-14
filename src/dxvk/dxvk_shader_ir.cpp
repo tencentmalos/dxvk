@@ -6,6 +6,8 @@
 
 #include "dxvk_shader_ir.h"
 
+#include "../util/util_env.h"
+
 namespace dxvk {
 
   size_t DxvkIrShaderCreateInfo::hash() const {
@@ -173,6 +175,39 @@ namespace dxvk {
    *
    * Also generates pipeline layout information from lowered resources.
    */
+  const DxvkXrGameRenderScale& DxvkXrGameRenderScale::get() {
+    static const DxvkXrGameRenderScale s_settings = [] {
+      DxvkXrGameRenderScale settings;
+
+      std::string scale = env::getEnvVar("XRGAME_RENDER_SCALE");
+      bool enabled = scale == "75" || scale == "50" || scale == "37.5" || scale == "25";
+
+      if (!enabled)
+        return settings;
+
+      uint32_t debug = 0u;
+      std::string debugEnv = env::getEnvVar("XRGAME_RENDER_SCALE_DEBUG");
+
+      if (!debugEnv.empty())
+        debug = uint32_t(std::strtoul(debugEnv.c_str(), nullptr, 0));
+
+      settings.fragCoord    = !(debug & 1u) && !(debug & 2u);
+      settings.texelMapping = !(debug & 1u) && !(debug & 4u);
+      settings.sizeQuery    = !(debug & 1u) && !(debug & 8u);
+
+      if (settings.fragCoord || settings.images())
+        settings.cacheSuffix = str::format("+xrgame-rs1-", debug);
+
+      Logger::info(str::format("XRGame render scale shaders: SV_Position ", settings.fragCoord ? "on" : "off",
+        ", texel coordinates ", settings.texelMapping ? "on" : "off",
+        ", size queries ", settings.sizeQuery ? "on" : "off"));
+      return settings;
+    }();
+
+    return s_settings;
+  }
+
+
   class DxvkIrLowerBindingModelPass {
 
   public:
@@ -264,6 +299,10 @@ namespace dxvk {
       }
 
       rewriteSamplers();
+
+      if (DxvkXrGameRenderScale::get().images())
+        rewriteScaledImages();
+
       rewriteUavCounters();
 
       if (m_sharedPushDataOffset) {
@@ -322,6 +361,17 @@ namespace dxvk {
       dxbc_spv::ir::SsaDef dcl = { };
     };
 
+    struct ScaledImageInfo {
+      dxbc_spv::ir::SsaDef dcl = { };
+      bool isUav = false;
+    };
+
+    struct ScaleTag {
+      dxbc_spv::ir::SsaDef scaled = { };
+      dxbc_spv::ir::SsaDef width = { };
+      dxbc_spv::ir::SsaDef height = { };
+    };
+
     struct ResourceKey {
       dxbc_spv::ir::OpCode opCode = { };
       uint32_t registerSpace = 0u;
@@ -373,6 +423,9 @@ namespace dxvk {
 
     small_vector<SamplerInfo,     16u>  m_samplers;
     small_vector<UavCounterInfo,  64u>  m_uavCounters;
+    small_vector<ScaledImageInfo, 16u>  m_scaledImages;
+
+    dxbc_spv::ir::SsaDef          m_fragCoordScaleFunction = { };
 
     std::unordered_map<ResourceKey, ResourceAlias, DxvkHash, DxvkEq> m_resources;
 
@@ -520,6 +573,8 @@ namespace dxvk {
       if (dxbc_spv::ir::resourceIsMultisampled(resourceKind))
         binding.flags.set(DxvkDescriptorFlag::Multisampled);
 
+      addScaledImageCandidate(op->getDef(), resourceKind, regCount, false);
+
       auto& resourceAlias = getResourceAlias(op->getOpCode(), regSpace, regIndex, binding.descriptorType);
 
       if (!resourceAlias.hasAlias)
@@ -559,6 +614,8 @@ namespace dxvk {
         binding.access |= VK_ACCESS_SHADER_WRITE_BIT;
         binding.accessOp = determineAccessOpForUav(op);
       }
+
+      addScaledImageCandidate(op->getDef(), resourceKind, regCount, true);
 
       auto& resourceAlias = getResourceAlias(op->getOpCode(), regSpace, regIndex, binding.descriptorType);
 
@@ -613,6 +670,10 @@ namespace dxvk {
 
       if (builtIn == dxbc_spv::ir::BuiltIn::eIsFullyCovered)
         m_metadata.flags.set(DxvkShaderFlag::UsesFragmentCoverage);
+
+      if (builtIn == dxbc_spv::ir::BuiltIn::ePosition && m_stage == dxbc_spv::ir::ShaderStage::ePixel
+       && DxvkXrGameRenderScale::get().fragCoord)
+        rewriteFragCoord(op->getDef());
 
       return ++op;
     }
@@ -1275,6 +1336,379 @@ namespace dxvk {
         binding.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
 
         addBinding(binding);
+      }
+    }
+
+
+    /**
+     * XRGame render scale. Render and depth targets may live in images smaller
+     * than the application created them (shadPS4's internal scale). Each 2D image
+     * that the shader loads from, stores to, does atomics on or queries the size
+     * of gets a push data tag: the requested width | height << 16 at the view's
+     * top mip, 0 when the image is not scaled. Integer texel coordinates are then
+     * mapped to floor((c + 0.5) * actual / requested) and size queries return the
+     * requested size. SV_Position is divided by the scale of the bound render
+     * targets, which the built-in push data carries.
+     */
+    void addScaledImageCandidate(dxbc_spv::ir::SsaDef dcl, dxbc_spv::ir::ResourceKind kind, uint32_t count, bool isUav) {
+      if (count != 1u)
+        return;
+
+      if (kind != dxbc_spv::ir::ResourceKind::eImage2D
+       && kind != dxbc_spv::ir::ResourceKind::eImage2DArray)
+        return;
+
+      auto& e = m_scaledImages.emplace_back();
+      e.dcl = dcl;
+      e.isUav = isUav;
+    }
+
+
+    bool imageNeedsScaleTag(dxbc_spv::ir::SsaDef dcl) {
+      small_vector<dxbc_spv::ir::SsaDef, 64u> descriptors;
+      m_builder.getUses(dcl, descriptors);
+
+      for (auto descriptor : descriptors) {
+        if (m_builder.getOp(descriptor).getOpCode() != dxbc_spv::ir::OpCode::eDescriptorLoad)
+          continue;
+
+        small_vector<dxbc_spv::ir::SsaDef, 64u> uses;
+        m_builder.getUses(descriptor, uses);
+
+        for (auto use : uses) {
+          switch (m_builder.getOp(use).getOpCode()) {
+            case dxbc_spv::ir::OpCode::eImageLoad:
+            case dxbc_spv::ir::OpCode::eImageStore:
+            case dxbc_spv::ir::OpCode::eImageAtomic:
+            case dxbc_spv::ir::OpCode::eImageQuerySize:
+              return true;
+
+            default:
+              break;
+          }
+        }
+      }
+
+      return false;
+    }
+
+
+    void rewriteScaledImages() {
+      small_vector<ScaledImageInfo, 16u> used;
+
+      for (const auto& e : m_scaledImages) {
+        if (imageNeedsScaleTag(e.dcl))
+          used.push_back(e);
+      }
+
+      if (used.empty())
+        return;
+
+      size_t maxPushDataSize = m_stage == dxbc_spv::ir::ShaderStage::eCompute
+        ? MaxTotalPushDataSize - MaxReservedPushDataSize
+        : MaxPerStagePushDataSize;
+
+      // The resource mask covers 32 dwords of the local block
+      maxPushDataSize = std::min<size_t>(maxPushDataSize, 32u * sizeof(uint32_t));
+
+      m_localPushDataOffset = align(m_localPushDataOffset, sizeof(uint32_t));
+
+      size_t space = m_localPushDataOffset < maxPushDataSize ? maxPushDataSize - m_localPushDataOffset : 0u;
+      uint32_t count = std::min<uint32_t>(used.size(), space / sizeof(uint32_t));
+
+      if (count < used.size()) {
+        static std::atomic<bool> s_logged = { false };
+
+        if (!s_logged.exchange(true)) {
+          Logger::warn(str::format("XRGame: no push data space for ", used.size() - count,
+            " render scale tags, those images keep application coordinates"));
+        }
+      }
+
+      if (!count)
+        return;
+
+      dxbc_spv::ir::Type pushDataType = { };
+
+      for (uint32_t i = 0u; i < count; i++)
+        pushDataType.addStructMember(dxbc_spv::ir::ScalarType::eU32);
+
+      auto pushDataVar = m_builder.add(dxbc_spv::ir::Op::DclPushData(
+        pushDataType, m_entryPoint, m_localPushDataOffset, m_stage));
+
+      for (uint32_t i = 0u; i < count; i++) {
+        const auto& dclOp = m_builder.getOp(used[i].dcl);
+
+        auto regSpace = uint32_t(dclOp.getOperand(1u));
+        auto regIndex = uint32_t(dclOp.getOperand(2u));
+
+        DxvkBindingInfo binding = { };
+        binding.resourceIndex = m_shader.determineResourceIndex(m_stage, used[i].isUav
+          ? dxbc_spv::ir::ScalarType::eUav : dxbc_spv::ir::ScalarType::eSrv, regSpace, regIndex);
+        binding.descriptorType = used[i].isUav
+          ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        binding.blockOffset = MaxSharedPushDataSize + m_localPushDataOffset;
+        binding.flags.set(DxvkDescriptorFlag::PushData);
+
+        addBinding(binding);
+
+        m_localPushDataResourceMask |= 1u << (m_localPushDataOffset / sizeof(uint32_t));
+        m_localPushDataOffset += sizeof(uint32_t);
+
+        std::string debugName = "xrgame_scale_" + getDebugName(used[i].dcl);
+        addDebugMemberName(pushDataVar, i, debugName);
+
+        rewriteScaledImageUses(used[i].dcl, pushDataVar, i);
+      }
+    }
+
+
+    void rewriteScaledImageUses(dxbc_spv::ir::SsaDef dcl, dxbc_spv::ir::SsaDef pushDataVar, uint32_t member) {
+      small_vector<dxbc_spv::ir::SsaDef, 64u> descriptors;
+      m_builder.getUses(dcl, descriptors);
+
+      for (auto descriptor : descriptors) {
+        if (m_builder.getOp(descriptor).getOpCode() != dxbc_spv::ir::OpCode::eDescriptorLoad)
+          continue;
+
+        small_vector<dxbc_spv::ir::SsaDef, 64u> uses;
+        m_builder.getUses(descriptor, uses);
+
+        const auto& settings = DxvkXrGameRenderScale::get();
+
+        for (auto use : uses) {
+          switch (m_builder.getOp(use).getOpCode()) {
+            case dxbc_spv::ir::OpCode::eImageLoad:
+              if (settings.texelMapping)
+                rewriteScaledImageCoord(use, pushDataVar, member, 3u, 1u, 5u);
+              break;
+
+            case dxbc_spv::ir::OpCode::eImageStore:
+            case dxbc_spv::ir::OpCode::eImageAtomic:
+              if (settings.texelMapping)
+                rewriteScaledImageCoord(use, pushDataVar, member, 2u, -1u, -1u);
+              break;
+
+            case dxbc_spv::ir::OpCode::eImageQuerySize:
+              if (settings.sizeQuery)
+                rewriteScaledImageQuery(use, pushDataVar, member);
+              break;
+
+            default:
+              break;
+          }
+        }
+      }
+    }
+
+
+    ScaleTag loadScaleTag(dxbc_spv::ir::SsaDef ref, dxbc_spv::ir::SsaDef pushDataVar, uint32_t member, dxbc_spv::ir::SsaDef mip) {
+      using namespace dxbc_spv::ir;
+
+      // A push data block with a single member is a plain scalar and takes no member index
+      SsaDef memberIndex = { };
+
+      if (m_builder.getOp(pushDataVar).getType().isStructType())
+        memberIndex = m_builder.makeConstant(member);
+
+      auto tag = m_builder.addBefore(ref, Op::PushDataLoad(ScalarType::eU32, pushDataVar, memberIndex));
+
+      ScaleTag result = { };
+      result.scaled = m_builder.addBefore(ref, Op::INe(ScalarType::eBool, tag, m_builder.makeConstant(0u)));
+      result.width = m_builder.addBefore(ref, Op::IAnd(ScalarType::eU32, tag, m_builder.makeConstant(0xffffu)));
+      result.height = m_builder.addBefore(ref, Op::UShr(ScalarType::eU32, tag, m_builder.makeConstant(16u)));
+
+      if (mip) {
+        result.width = m_builder.addBefore(ref, Op::UShr(ScalarType::eU32, result.width, mip));
+        result.height = m_builder.addBefore(ref, Op::UShr(ScalarType::eU32, result.height, mip));
+      }
+
+      // Unscaled images have a zero tag; keep the divisor valid either way
+      result.width = m_builder.addBefore(ref, Op::UMax(ScalarType::eU32, result.width, m_builder.makeConstant(1u)));
+      result.height = m_builder.addBefore(ref, Op::UMax(ScalarType::eU32, result.height, m_builder.makeConstant(1u)));
+      return result;
+    }
+
+
+    dxbc_spv::ir::SsaDef mapScaledCoord(dxbc_spv::ir::SsaDef ref, dxbc_spv::ir::SsaDef coord,
+        dxbc_spv::ir::SsaDef actual, dxbc_spv::ir::SsaDef requested, dxbc_spv::ir::SsaDef scaled) {
+      using namespace dxbc_spv::ir;
+
+      // floor((c + 0.5) * actual / requested); out-of-bounds coordinates stay out of bounds
+      auto signedCoord = m_builder.addBefore(ref, Op::Cast(ScalarType::eI32, coord));
+      auto value = m_builder.addBefore(ref, Op::ConvertItoF(ScalarType::eF32, signedCoord));
+      value = m_builder.addBefore(ref, Op::FAdd(ScalarType::eF32, value, m_builder.makeConstant(0.5f)));
+
+      auto actualF = m_builder.addBefore(ref, Op::ConvertItoF(ScalarType::eF32, actual));
+      auto requestedF = m_builder.addBefore(ref, Op::ConvertItoF(ScalarType::eF32, requested));
+
+      value = m_builder.addBefore(ref, Op::FMul(ScalarType::eF32, value, actualF));
+      value = m_builder.addBefore(ref, Op::FDiv(ScalarType::eF32, value, requestedF));
+      value = m_builder.addBefore(ref, Op::FRound(ScalarType::eF32, value, RoundMode::eNegativeInf));
+
+      auto mapped = m_builder.addBefore(ref, Op::ConvertFtoI(ScalarType::eI32, value));
+      mapped = m_builder.addBefore(ref, Op::Cast(ScalarType::eU32, mapped));
+
+      return m_builder.addBefore(ref, Op::Select(ScalarType::eU32, scaled, mapped, coord));
+    }
+
+
+    void rewriteScaledImageCoord(dxbc_spv::ir::SsaDef use, dxbc_spv::ir::SsaDef pushDataVar,
+        uint32_t member, uint32_t coordOperand, uint32_t mipOperand, uint32_t offsetOperand) {
+      using namespace dxbc_spv::ir;
+
+      auto useOp = Op(m_builder.getOp(use));
+
+      auto descriptor = SsaDef(useOp.getOperand(0u));
+      auto coord = SsaDef(useOp.getOperand(coordOperand));
+      auto mip = mipOperand != -1u ? SsaDef(useOp.getOperand(mipOperand)) : SsaDef();
+      auto offset = offsetOperand != -1u ? SsaDef(useOp.getOperand(offsetOperand)) : SsaDef();
+
+      if (!coord)
+        return;
+
+      auto coordType = m_builder.getOp(coord).getType();
+
+      if (!coordType.isBasicType() || coordType.getBaseType(0u).getVectorSize() != 2u)
+        return;
+
+      auto coordScalar = coordType.getBaseType(0u).getBaseType();
+
+      if (coordScalar != ScalarType::eU32 && coordScalar != ScalarType::eI32)
+        return;
+
+      // Actual size of the image at the accessed mip
+      auto sizeType = Type()
+        .addStructMember(ScalarType::eU32, 2u)
+        .addStructMember(ScalarType::eU32);
+
+      auto sizeInfo = m_builder.addBefore(use, Op::ImageQuerySize(sizeType, descriptor, mip));
+      auto tag = loadScaleTag(use, pushDataVar, member, mip);
+
+      std::array<SsaDef, 2u> components = { };
+
+      for (uint32_t i = 0u; i < 2u; i++) {
+        auto c = m_builder.addBefore(use, Op::CompositeExtract(coordScalar, coord, m_builder.makeConstant(i)));
+
+        if (coordScalar != ScalarType::eU32)
+          c = m_builder.addBefore(use, Op::Cast(ScalarType::eU32, c));
+
+        // Immediate offsets count texels of the requested size
+        if (offset) {
+          auto o = m_builder.addBefore(use, Op::CompositeExtract(ScalarType::eI32, offset, m_builder.makeConstant(i)));
+          o = m_builder.addBefore(use, Op::Cast(ScalarType::eU32, o));
+          c = m_builder.addBefore(use, Op::IAdd(ScalarType::eU32, c, o));
+        }
+
+        auto actual = m_builder.addBefore(use, Op::CompositeExtract(ScalarType::eU32, sizeInfo, m_builder.makeConstant(0u, i)));
+        c = mapScaledCoord(use, c, actual, i ? tag.height : tag.width, tag.scaled);
+
+        if (coordScalar != ScalarType::eU32)
+          c = m_builder.addBefore(use, Op::Cast(coordScalar, c));
+
+        components[i] = c;
+      }
+
+      auto newCoord = m_builder.addBefore(use, Op::CompositeConstruct(coordType, components[0u], components[1u]));
+
+      useOp.setOperand(coordOperand, newCoord);
+
+      if (offset)
+        useOp.setOperand(offsetOperand, SsaDef());
+
+      m_builder.rewriteOp(use, std::move(useOp));
+    }
+
+
+    void rewriteScaledImageQuery(dxbc_spv::ir::SsaDef use, dxbc_spv::ir::SsaDef pushDataVar, uint32_t member) {
+      using namespace dxbc_spv::ir;
+
+      auto queryOp = Op(m_builder.getOp(use));
+      auto queryType = queryOp.getType();
+
+      if (!queryType.isStructType() || queryType.getBaseType(0u).getVectorSize() != 2u)
+        return;
+
+      auto mip = SsaDef(queryOp.getOperand(1u));
+      auto sizeInfo = m_builder.addBefore(use, Op(queryOp));
+      auto tag = loadScaleTag(use, pushDataVar, member, mip);
+
+      auto sizeType = Type(queryType.getBaseType(0u));
+      auto layers = m_builder.addBefore(use, Op::CompositeExtract(Type(queryType.getBaseType(1u)), sizeInfo, m_builder.makeConstant(1u)));
+
+      std::array<SsaDef, 2u> components = { };
+
+      for (uint32_t i = 0u; i < 2u; i++) {
+        auto actual = m_builder.addBefore(use, Op::CompositeExtract(ScalarType::eU32, sizeInfo, m_builder.makeConstant(0u, i)));
+        components[i] = m_builder.addBefore(use, Op::Select(ScalarType::eU32, tag.scaled, i ? tag.height : tag.width, actual));
+      }
+
+      auto size = m_builder.addBefore(use, Op::CompositeConstruct(sizeType, components[0u], components[1u]));
+      m_builder.rewriteOp(use, Op::CompositeConstruct(queryType, size, layers));
+    }
+
+
+    dxbc_spv::ir::SsaDef getFragCoordScaleFunction() {
+      using namespace dxbc_spv::ir;
+
+      if (m_fragCoordScaleFunction)
+        return m_fragCoordScaleFunction;
+
+      // 8 / eighths of the bound render targets, 1 when they are not scaled
+      auto ref = m_builder.getCode().first->getDef();
+
+      auto helper = m_builder.addBefore(ref, Op::Function(ScalarType::eF32));
+      auto cursor = m_builder.setCursor(helper);
+
+      m_builder.add(Op::Label());
+
+      auto value = m_builder.add(Op::PushDataLoad(ScalarType::eU32, defineBuiltInPushData(), SsaDef()));
+      value = m_builder.add(Op::UBitExtract(ScalarType::eU32, value,
+        m_builder.makeConstant(DxvkBuiltInPushData::RenderScaleOffset),
+        m_builder.makeConstant(DxvkBuiltInPushData::RenderScaleBits)));
+
+      auto unscaled = m_builder.add(Op::IEq(ScalarType::eBool, value, m_builder.makeConstant(0u)));
+      value = m_builder.add(Op::Select(ScalarType::eU32, unscaled, m_builder.makeConstant(8u), value));
+      value = m_builder.add(Op::ConvertItoF(ScalarType::eF32, value));
+      value = m_builder.add(Op::FDiv(ScalarType::eF32, m_builder.makeConstant(8.0f), value));
+
+      m_builder.add(Op::Return(ScalarType::eF32, value));
+      m_builder.add(Op::FunctionEnd());
+      m_builder.setCursor(cursor);
+
+      m_builder.add(Op::DebugName(helper, "xrgame_frag_coord_scale"));
+
+      m_fragCoordScaleFunction = helper;
+      return helper;
+    }
+
+
+    void rewriteFragCoord(dxbc_spv::ir::SsaDef dcl) {
+      using namespace dxbc_spv::ir;
+
+      small_vector<SsaDef, 64u> uses;
+      m_builder.getUses(dcl, uses);
+
+      for (auto use : uses) {
+        auto loadOp = Op(m_builder.getOp(use));
+
+        if (loadOp.getOpCode() != OpCode::eInputLoad || loadOp.getType() != ScalarType::eF32)
+          continue;
+
+        auto address = SsaDef(loadOp.getOperand(1u));
+
+        if (!address || !m_builder.getOp(address).isConstant())
+          continue;
+
+        auto component = uint32_t(m_builder.getOp(address).getOperand(0u));
+
+        if (component > 1u)
+          continue;
+
+        auto load = m_builder.addBefore(use, std::move(loadOp));
+        auto factor = m_builder.addBefore(use, Op::FunctionCall(ScalarType::eF32, getFragCoordScaleFunction()));
+
+        m_builder.rewriteOp(use, Op::FMul(ScalarType::eF32, load, factor));
       }
     }
 

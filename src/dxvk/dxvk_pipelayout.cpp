@@ -651,8 +651,14 @@ namespace dxvk {
       if (binding.getDescriptorType() == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
         throw DxvkError("Combined image/sampler descriptors not supported");
 
+      // XRGame render scale tags are push data copied from image views and
+      // carry no access of their own
+      bool isScaleTag = !binding.usesDescriptor()
+        && (binding.getDescriptorType() == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
+         || binding.getDescriptorType() == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+
       if (binding.getDescriptorCount()) {
-        if (binding.getDescriptorType() != VK_DESCRIPTOR_TYPE_SAMPLER) {
+        if (binding.getDescriptorType() != VK_DESCRIPTOR_TYPE_SAMPLER && !isScaleTag) {
           if (binding.getAccess() & vk::AccessWriteMask) {
             appendDescriptors(m_readWriteResources, binding, srcMapping);
 

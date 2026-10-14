@@ -104,7 +104,7 @@ namespace dxvk {
 
     // Create the underlying image view object
     m_view = GetCommonTexture(pResource)->GetImage()->createView(viewInfo);
-    m_xrgameScale = GetCommonTexture(pResource)->XrGameScalePercent();
+    m_xrgameScale = GetCommonTexture(pResource)->XrGameScaleEighths();
   }
   
   

@@ -164,9 +164,9 @@ namespace dxvk {
     VkFormat packedFormat = m_parent->LookupPackedFormat(desc->Format, pTexture->GetFormatMode()).Format;
     auto formatInfo = lookupFormatInfo(packedFormat);
 
-    // XRGame: a scaled depth image cannot take the application's full-size data.
-    if (pTexture->XrGameScalePercent() && pInitialData != nullptr && pInitialData->pSysMem != nullptr) {
-      Logger::warn("XRGame: initial data of a scaled depth image is dropped");
+    // XRGame: an image reduced by the render scale cannot take the application's full-size data.
+    if (pTexture->XrGameScaleEighths() && pInitialData != nullptr && pInitialData->pSysMem != nullptr) {
+      Logger::warn("XRGame: initial data of an image scaled by the render scale is dropped");
       pInitialData = nullptr;
     }
 

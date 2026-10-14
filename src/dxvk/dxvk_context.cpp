@@ -6704,6 +6704,25 @@ namespace dxvk {
 
         VkDeviceAddress va = 0u;
 
+        // XRGame render scale tag of an image the shader maps coordinates for
+        if (binding.getDescriptorType() == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
+         || binding.getDescriptorType() == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) {
+          uint32_t tag = 0u;
+
+          if (res.imageView) {
+            VkExtent2D requested = res.imageView->image()->info().xrgameRequestedExtent;
+
+            if (unlikely(requested.width)) {
+              uint32_t mip = res.imageView->info().mipIndex;
+              tag = std::max(1u, requested.width >> mip)
+                  | std::max(1u, requested.height >> mip) << 16u;
+            }
+          }
+
+          std::memcpy(&m_state.pc.resourceData[binding.getBlockOffset()], &tag, sizeof(tag));
+          continue;
+        }
+
         if (binding.isUniformBuffer()) {
           const auto& slice = m_uniformBuffers[binding.getResourceIndex()];
 

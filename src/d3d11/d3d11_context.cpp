@@ -3452,7 +3452,7 @@ namespace dxvk {
     }
 
     EmitCs([
-      cPushConstants = DxvkBuiltInPushData(sampleCount, m_maxTessFactor)
+      cPushConstants = DxvkBuiltInPushData(sampleCount, m_maxTessFactor, m_state.om.xrgameScale)
     ] (DxvkContext* ctx) {
       ctx->pushData(VK_SHADER_STAGE_ALL_GRAPHICS,
         0u, sizeof(cPushConstants), &cPushConstants);
@@ -3502,11 +3502,11 @@ namespace dxvk {
             uint32_t(std::max(sr.top, sr.bottom) - sr.top) };
         }
 
-        // XRGame: the bound depth target is scaled, so the application's
-        // coordinates are scaled with it.
+        // XRGame: the bound render targets are scaled, so the application's
+        // coordinates are scaled with them.
         if (unlikely(m_state.om.xrgameScale)) {
-          uint32_t percent = m_state.om.xrgameScale;
-          float scale = float(percent) / 100.0f;
+          uint32_t eighths = m_state.om.xrgameScale;
+          float scale = float(eighths) / 8.0f;
 
           dst->viewport.x      *= scale;
           dst->viewport.y      *= scale;
@@ -3516,10 +3516,10 @@ namespace dxvk {
           if (enableScissorTest && i < m_state.rs.numScissors) {
             const auto& sr = m_state.rs.scissors[i];
 
-            int32_t x0 = int32_t((int64_t(sr.left) * percent) / 100);
-            int32_t y0 = int32_t((int64_t(sr.top)  * percent) / 100);
-            int32_t x1 = int32_t((int64_t(std::max(sr.left, sr.right))  * percent + 99) / 100);
-            int32_t y1 = int32_t((int64_t(std::max(sr.top,  sr.bottom)) * percent + 99) / 100);
+            int32_t x0 = int32_t((int64_t(sr.left) * eighths) / 8);
+            int32_t y0 = int32_t((int64_t(sr.top)  * eighths) / 8);
+            int32_t x1 = int32_t((int64_t(std::max(sr.left, sr.right))  * eighths + 7) / 8);
+            int32_t y1 = int32_t((int64_t(std::max(sr.top,  sr.bottom)) * eighths + 7) / 8);
 
             dst->scissor.offset = VkOffset2D { x0, y0 };
             dst->scissor.extent = VkExtent2D {
@@ -3725,36 +3725,48 @@ namespace dxvk {
       ctx->bindRenderTargets(Forwarder::move(cAttachments), 0u);
     });
 
-    // If necessary, update push constant for the sample count
-    if (m_state.om.sampleCount != sampleCount) {
-      m_state.om.sampleCount = sampleCount;
-      ApplyRasterizerSampleCount();
+    // XRGame: rendering into targets reduced by the render scale scales viewports
+    // and scissors, and pixel shaders get the scale through the built-in push data
+    // to take SV_Position back to the application's coordinates. Targets of
+    // different scales bound together render at the scale of the scaled ones.
+    uint32_t xrgameScale = 0u;
+    bool xrgameUnscaled = false;
+    bool xrgameMixed = false;
+
+    auto addXrGameScale = [&] (uint32_t scale) {
+      if (!scale)
+        xrgameUnscaled = true;
+      else if (xrgameScale && xrgameScale != scale)
+        xrgameMixed = true;
+      else
+        xrgameScale = scale;
+    };
+
+    for (UINT i = 0; i < m_state.om.rtvs.size(); i++) {
+      if (m_state.om.rtvs[i] != nullptr)
+        addXrGameScale(m_state.om.rtvs[i]->XrGameScaleEighths());
     }
 
-    // XRGame: rendering into a scaled depth target scales viewports and scissors
-    uint32_t xrgameScale = m_state.om.dsv != nullptr ? m_state.om.dsv->XrGameScalePercent() : 0u;
+    if (m_state.om.dsv != nullptr)
+      addXrGameScale(m_state.om.dsv->XrGameScaleEighths());
 
-    if (unlikely(xrgameScale)) {
+    if (unlikely(xrgameScale && (xrgameUnscaled || xrgameMixed))) {
       static std::atomic<bool> s_logged = { false };
 
-      for (UINT i = 0; i < m_state.om.rtvs.size(); i++) {
-        if (m_state.om.rtvs[i] != nullptr) {
-          if (!s_logged.exchange(true)) {
-            VkExtent3D dsvExtent = m_state.om.dsv->GetImageView()->mipLevelExtent(0);
-            VkExtent3D rtvExtent = m_state.om.rtvs[i]->GetImageView()->mipLevelExtent(0);
-
-            Logger::warn(str::format("XRGame: a depth target scaled by the render scale setting (",
-              dsvExtent.width, "x", dsvExtent.height, ") is bound with a ",
-              rtvExtent.width, "x", rtvExtent.height, " render target"));
-          }
-          break;
-        }
-      }
+      if (!s_logged.exchange(true))
+        Logger::warn("XRGame: render targets of different render scales are bound together");
     }
 
-    if (unlikely(m_state.om.xrgameScale != xrgameScale)) {
-      m_state.om.xrgameScale = xrgameScale;
+    bool xrgameChanged = m_state.om.xrgameScale != xrgameScale;
+    m_state.om.xrgameScale = xrgameScale;
+
+    if (unlikely(xrgameChanged))
       ApplyViewportState();
+
+    // If necessary, update push constant for the sample count and render scale
+    if (m_state.om.sampleCount != sampleCount || xrgameChanged) {
+      m_state.om.sampleCount = sampleCount;
+      ApplyRasterizerSampleCount();
     }
   }
 
@@ -4093,6 +4105,9 @@ namespace dxvk {
     VkExtent3D extent3D = View->mipLevelExtent(0);
     VkExtent2D extent2D = { extent3D.width, extent3D.height };
 
+    // XRGame: rectangles are in the size the application created the image with
+    VkExtent3D appExtent = XrGameAppExtent(View);
+
     // Figure out which plane we're clearing for subsampling
     const DxvkPlaneFormatInfo* plane = nullptr;
     auto imageFormatInfo = View->image()->formatInfo();
@@ -4127,6 +4142,13 @@ namespace dxvk {
       for (uint32_t i = 0; i < NumRects; i++) {
         D3D11_RECT subsampledRect = pRects[i];
 
+        if (unlikely(appExtent.width != extent3D.width || appExtent.height != extent3D.height)) {
+          subsampledRect.left   = LONG((int64_t(subsampledRect.left)   * extent3D.width)  / appExtent.width);
+          subsampledRect.top    = LONG((int64_t(subsampledRect.top)    * extent3D.height) / appExtent.height);
+          subsampledRect.right  = LONG((int64_t(subsampledRect.right)  * extent3D.width  + appExtent.width  - 1) / appExtent.width);
+          subsampledRect.bottom = LONG((int64_t(subsampledRect.bottom) * extent3D.height + appExtent.height - 1) / appExtent.height);
+        }
+
         if (plane) {
           subsampledRect.left   /= plane->blockSize.width;
           subsampledRect.top    /= plane->blockSize.height;
@@ -4141,6 +4163,97 @@ namespace dxvk {
       vkRect->offset = VkOffset2D { 0, 0 };
       vkRect->extent = extent2D;
     }
+  }
+
+
+  template<typename ContextType>
+  bool D3D11CommonContext<ContextType>::XrGameBlitImage(
+          D3D11CommonTexture*               pDstTexture,
+    const VkImageSubresourceLayers*         pDstLayers,
+          VkOffset3D                        DstOffset,
+          D3D11CommonTexture*               pSrcTexture,
+    const VkImageSubresourceLayers*         pSrcLayers,
+          VkOffset3D                        SrcOffset,
+          VkExtent3D                        SrcExtent) {
+    // XRGame: a copy between images of different render scales stretches the
+    // region with a blit. Staging images, depth images and multisampled images
+    // are not handled.
+    if (!pDstTexture->HasImage() || !pSrcTexture->HasImage()
+     || pDstTexture->XrGameMipDrop() || pSrcTexture->XrGameMipDrop()
+     || pDstLayers->layerCount != pSrcLayers->layerCount)
+      return false;
+
+    Rc<DxvkImage> dstImage = pDstTexture->GetImage();
+    Rc<DxvkImage> srcImage = pSrcTexture->GetImage();
+
+    if ((dstImage->formatInfo()->aspectMask | srcImage->formatInfo()->aspectMask) != VK_IMAGE_ASPECT_COLOR_BIT
+     || dstImage->info().sampleCount != VK_SAMPLE_COUNT_1_BIT
+     || srcImage->info().sampleCount != VK_SAMPLE_COUNT_1_BIT)
+      return false;
+
+    auto dstFeatures = m_device->adapter()->getFormatFeatures(dstImage->info().format);
+    auto srcFeatures = m_device->adapter()->getFormatFeatures(srcImage->info().format);
+
+    if (!(dstFeatures.optimal & VK_FORMAT_FEATURE_2_BLIT_DST_BIT)
+     || !(srcFeatures.optimal & VK_FORMAT_FEATURE_2_BLIT_SRC_BIT))
+      return false;
+
+    // Map the region from the application's mip size onto the image's
+    auto mapRegion = [] (D3D11CommonTexture* texture, uint32_t mip,
+        VkOffset3D offset, VkExtent3D extent, std::array<VkOffset3D, 2>& out) {
+      VkExtent3D app = texture->MipLevelExtent(mip);
+      VkExtent3D img = texture->GetImage()->mipLevelExtent(mip);
+
+      out[0] = VkOffset3D {
+        int32_t((uint64_t(offset.x) * img.width)  / app.width),
+        int32_t((uint64_t(offset.y) * img.height) / app.height), 0 };
+      out[1] = VkOffset3D {
+        int32_t(std::min<uint64_t>(img.width,  (uint64_t(offset.x + extent.width)  * img.width  + app.width  - 1u) / app.width)),
+        int32_t(std::min<uint64_t>(img.height, (uint64_t(offset.y + extent.height) * img.height + app.height - 1u) / app.height)), 1 };
+    };
+
+    std::array<VkOffset3D, 2> dstOffsets = { };
+    std::array<VkOffset3D, 2> srcOffsets = { };
+
+    mapRegion(pDstTexture, pDstLayers->mipLevel, DstOffset, SrcExtent, dstOffsets);
+    mapRegion(pSrcTexture, pSrcLayers->mipLevel, SrcOffset, SrcExtent, srcOffsets);
+
+    bool isInteger = dstImage->formatInfo()->flags.any(DxvkFormatFlag::SampledUInt, DxvkFormatFlag::SampledSInt)
+                  || srcImage->formatInfo()->flags.any(DxvkFormatFlag::SampledUInt, DxvkFormatFlag::SampledSInt);
+
+    for (uint32_t i = 0; i < pDstLayers->layerCount; i++) {
+      DxvkImageViewKey dstKey;
+      dstKey.viewType = VK_IMAGE_VIEW_TYPE_2D;
+      dstKey.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+      dstKey.format = dstImage->info().format;
+      dstKey.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+      dstKey.mipIndex = pDstLayers->mipLevel;
+      dstKey.mipCount = 1u;
+      dstKey.layerIndex = pDstLayers->baseArrayLayer + i;
+      dstKey.layerCount = 1u;
+
+      DxvkImageViewKey srcKey = dstKey;
+      srcKey.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+      srcKey.format = srcImage->info().format;
+      srcKey.mipIndex = pSrcLayers->mipLevel;
+      srcKey.layerIndex = pSrcLayers->baseArrayLayer + i;
+
+      EmitCs([
+        cDstImage   = dstImage,
+        cSrcImage   = srcImage,
+        cDstKey     = dstKey,
+        cSrcKey     = srcKey,
+        cDstOffsets = dstOffsets,
+        cSrcOffsets = srcOffsets,
+        cFilter     = isInteger ? VK_FILTER_NEAREST : VK_FILTER_LINEAR
+      ] (DxvkContext* ctx) {
+        ctx->blitImageView(
+          cDstImage->createView(cDstKey), cDstOffsets.data(),
+          cSrcImage->createView(cSrcKey), cSrcOffsets.data(), cFilter);
+      });
+    }
+
+    return true;
   }
 
 
@@ -4354,12 +4467,15 @@ namespace dxvk {
       static std::atomic<bool> s_loggedScale = { false };
       static std::atomic<bool> s_loggedLevel = { false };
 
-      uint32_t scale = pDstTexture->XrGameScalePercent();
+      uint32_t scale = pDstTexture->XrGameScaleEighths();
 
-      if (scale || pSrcTexture->XrGameScalePercent()) {
-        if (scale != pSrcTexture->XrGameScalePercent()) {
+      if (scale || pSrcTexture->XrGameScaleEighths()) {
+        if (scale != pSrcTexture->XrGameScaleEighths()) {
+          if (XrGameBlitImage(pDstTexture, pDstLayers, DstOffset, pSrcTexture, pSrcLayers, SrcOffset, SrcExtent))
+            return;
+
           if (!s_loggedScale.exchange(true))
-            Logger::warn("XRGame: copy between scaled and unscaled depth images is skipped");
+            Logger::warn("XRGame: copy between images of different render scales is skipped");
           return;
         }
 
@@ -4374,7 +4490,22 @@ namespace dxvk {
         srcImageExtent.height = std::min(
           XrGameScaleEnd(SrcOffset.y + SrcExtent.height, scale) - srcImageOffset.y,
           XrGameScaleEnd(DstOffset.y + SrcExtent.height, scale) - dstImageOffset.y);
+
+        // Ends round up, the images round down; stay inside both
+        if (pSrcTexture->HasImage() && pDstTexture->HasImage()) {
+          VkExtent3D srcImageMip = pSrcTexture->GetImage()->mipLevelExtent(srcImageLayers.mipLevel);
+          VkExtent3D dstImageMip = pDstTexture->GetImage()->mipLevelExtent(dstImageLayers.mipLevel);
+
+          srcImageExtent.width = std::min(srcImageExtent.width, uint32_t(std::max(0,
+            std::min(int32_t(srcImageMip.width) - srcImageOffset.x, int32_t(dstImageMip.width) - dstImageOffset.x))));
+          srcImageExtent.height = std::min(srcImageExtent.height, uint32_t(std::max(0,
+            std::min(int32_t(srcImageMip.height) - srcImageOffset.y, int32_t(dstImageMip.height) - dstImageOffset.y))));
+        }
+
         dstImageExtent = srcImageExtent;
+
+        if (!srcImageExtent.width || !srcImageExtent.height)
+          return;
       }
 
       // Nothing to write if the destination level does not exist
@@ -5786,10 +5917,10 @@ namespace dxvk {
     if (dstIsImage) {
       VkImageSubresourceLayers dstLayers = vk::makeSubresourceLayers(*pDstSubresource);
 
-      // XRGame: levels the image leaves out take no data, and scaled depth
-      // images cannot take the application's full-size data.
+      // XRGame: levels the image leaves out take no data, and images reduced
+      // by the render scale cannot take the application's full-size data.
       if (unlikely(pDstTexture->XrGameReduced())) {
-        if (pDstTexture->XrGameScalePercent() || !pDstTexture->XrGameMapMip(dstLayers.mipLevel))
+        if (pDstTexture->XrGameScaleEighths() || !pDstTexture->XrGameMapMip(dstLayers.mipLevel))
           return;
       }
 
@@ -5954,18 +6085,12 @@ namespace dxvk {
     VkExtent3D dsvExtent = { 0u, 0u, 0u };
     VkExtent3D rtvExtent = { 0u, 0u, 0u };
 
+    // XRGame: sizes are compared as the application created the images,
+    // not as the render scale reduced them.
     if (pDepthStencilView != nullptr) {
       refView = static_cast<D3D11DepthStencilView*>(
         pDepthStencilView)->GetImageView();
-      dsvExtent = refView->mipLevelExtent(0);
-
-      // XRGame: compare the size the application created, not the scaled image
-      uint32_t xrgameScale = static_cast<D3D11DepthStencilView*>(pDepthStencilView)->XrGameScalePercent();
-
-      if (unlikely(xrgameScale)) {
-        dsvExtent.width  = uint32_t((uint64_t(dsvExtent.width)  * 100u) / xrgameScale);
-        dsvExtent.height = uint32_t((uint64_t(dsvExtent.height) * 100u) / xrgameScale);
-      }
+      dsvExtent = XrGameAppExtent(refView);
     }
 
     for (uint32_t i = 0; i < NumViews; i++) {
@@ -5974,7 +6099,7 @@ namespace dxvk {
           ppRenderTargetViews[i])->GetImageView();
 
         if (!rtvExtent.width)
-          rtvExtent = curView->mipLevelExtent(0);
+          rtvExtent = XrGameAppExtent(curView);
 
         if (refView != nullptr) {
           // Render target views must all have the same sample count,
@@ -5989,7 +6114,7 @@ namespace dxvk {
             return false;
 
           // Color targets must all be the same size
-          VkExtent3D curExtent = curView->mipLevelExtent(0);
+          VkExtent3D curExtent = XrGameAppExtent(curView);
 
           if (curExtent.width  != rtvExtent.width
            || curExtent.height != rtvExtent.height)
