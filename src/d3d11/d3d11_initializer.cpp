@@ -188,9 +188,12 @@ namespace dxvk {
           uint32_t index = D3D11CalcSubresource(mip, layer, desc->MipLevels);
           VkExtent3D mipLevelExtent = pTexture->MipLevelExtent(mip);
 
-          if (pTexture->HasImage()) {
+          // XRGame texture quality: levels the image leaves out are not uploaded.
+          uint32_t imageMip = mip;
+
+          if (pTexture->HasImage() && pTexture->XrGameMapMip(imageMip)) {
             VkDeviceSize mipSizePerLayer = util::computeImageDataSize(
-              packedFormat, image->mipLevelExtent(mip), formatInfo->aspectMask);
+              packedFormat, image->mipLevelExtent(imageMip), formatInfo->aspectMask);
 
             m_transferCommands += 1;
 

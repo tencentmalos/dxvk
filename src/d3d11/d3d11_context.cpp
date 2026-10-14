@@ -836,6 +836,14 @@ namespace dxvk {
     D3D11CommonTexture* dstTextureInfo = GetCommonTexture(pDstResource);
     D3D11CommonTexture* srcTextureInfo = GetCommonTexture(pSrcResource);
 
+    if (unlikely(dstTextureInfo->XrGameReduced() || srcTextureInfo->XrGameReduced())) {
+      static std::atomic<bool> s_logged = { false };
+
+      if (!s_logged.exchange(true))
+        Logger::warn("XRGame: resolve with an image reduced by the texture quality setting is skipped");
+      return;
+    }
+
     const DXGI_VK_FORMAT_INFO dstFormatInfo = m_parent->LookupFormat(dstDesc.Format, DXGI_VK_FORMAT_MODE_ANY);
     const DXGI_VK_FORMAT_INFO srcFormatInfo = m_parent->LookupFormat(srcDesc.Format, DXGI_VK_FORMAT_MODE_ANY);
 
@@ -4279,6 +4287,27 @@ namespace dxvk {
     VkExtent3D dstExtent = util::computeBlockExtent(blockCount, dstFormatInfo->blockSize);
     dstExtent = util::snapExtent3D(DstOffset, dstExtent, dstMipExtent);
 
+    // XRGame texture quality: the images may leave out top mip levels. Everything
+    // above is in D3D11 terms, which stays valid for kept levels since those have
+    // the same sizes. Only the image side of the copy changes; staging buffers keep
+    // D3D11 indices.
+    VkImageSubresourceLayers dstImageLayers = *pDstLayers;
+    VkImageSubresourceLayers srcImageLayers = *pSrcLayers;
+
+    if (unlikely(pDstTexture->XrGameReduced() || pSrcTexture->XrGameReduced())) {
+      static std::atomic<bool> s_loggedLevel = { false };
+
+      // Nothing to write if the destination level does not exist
+      if (!pDstTexture->XrGameMapMip(dstImageLayers.mipLevel))
+        return;
+
+      if (!pSrcTexture->XrGameMapMip(srcImageLayers.mipLevel)) {
+        if (!s_loggedLevel.exchange(true))
+          Logger::warn("XRGame: copy from a mip level left out by the texture quality setting is skipped");
+        return;
+      }
+    }
+
     // It is possible for any of the given images to be a staging image with
     // no actual image, so we need to account for all possibilities here.
     bool dstIsImage = pDstTexture->HasImage();
@@ -4288,8 +4317,8 @@ namespace dxvk {
       EmitCs([
         cDstImage  = pDstTexture->GetImage(),
         cSrcImage  = pSrcTexture->GetImage(),
-        cDstLayers = *pDstLayers,
-        cSrcLayers = *pSrcLayers,
+        cDstLayers = dstImageLayers,
+        cSrcLayers = srcImageLayers,
         cDstOffset = DstOffset,
         cSrcOffset = SrcOffset,
         cExtent    = SrcExtent
@@ -4343,7 +4372,7 @@ namespace dxvk {
 
           if (dstIsImage) {
             VkImageSubresourceLayers dstLayer = { dstAspectMask,
-              pDstLayers->mipLevel, pDstLayers->baseArrayLayer + i, 1 };
+              dstImageLayers.mipLevel, pDstLayers->baseArrayLayer + i, 1 };
 
             EmitCs([
               cDstImage   = pDstTexture->GetImage(),
@@ -4363,7 +4392,7 @@ namespace dxvk {
             });
           } else if (srcIsImage) {
             VkImageSubresourceLayers srcLayer = { srcAspectMask,
-              pSrcLayers->mipLevel, pSrcLayers->baseArrayLayer + i, 1 };
+              srcImageLayers.mipLevel, pSrcLayers->baseArrayLayer + i, 1 };
 
             EmitCs([
               cSrcImage   = pSrcTexture->GetImage(),
@@ -5675,9 +5704,15 @@ namespace dxvk {
       pDstSubresource->arrayLayer, pDstTexture->Desc()->MipLevels);
 
     if (dstIsImage) {
+      VkImageSubresourceLayers dstLayers = vk::makeSubresourceLayers(*pDstSubresource);
+
+      // XRGame texture quality: levels the image leaves out take no data.
+      if (unlikely(!pDstTexture->XrGameMapMip(dstLayers.mipLevel)))
+        return;
+
       EmitCs([
         cDstImage         = pDstTexture->GetImage(),
-        cDstLayers        = vk::makeSubresourceLayers(*pDstSubresource),
+        cDstLayers        = dstLayers,
         cDstOffset        = DstOffset,
         cDstExtent        = DstExtent,
         cStagingSlice     = std::move(StagingBuffer),

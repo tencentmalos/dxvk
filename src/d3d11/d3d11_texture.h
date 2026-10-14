@@ -149,6 +149,32 @@ namespace dxvk {
     }
 
     /**
+     * \brief XRGame texture quality: top mip levels the image leaves out
+     *
+     * D3D11 mip N is image mip N - XrGameMipDrop(). The application keeps
+     * seeing its own description; only the image is smaller.
+     */
+    uint32_t XrGameMipDrop() const {
+      return m_xrgameMipDrop;
+    }
+
+    bool XrGameReduced() const {
+      return m_xrgameMipDrop != 0u;
+    }
+
+    /**
+     * \brief Maps a D3D11 mip level to the image
+     * \returns \c false if the image leaves the level out
+     */
+    bool XrGameMapMip(uint32_t& Level) const {
+      if (Level < m_xrgameMipDrop)
+        return false;
+
+      Level -= m_xrgameMipDrop;
+      return true;
+    }
+
+    /**
      * \brief Special DXGI usage flags
      *
      * Flags that are set in addition to the bind
@@ -587,6 +613,12 @@ namespace dxvk {
     small_vector<MappedInfo, 6>   m_mapInfo;
 
     void*                         m_mapPtr = nullptr;
+
+    uint32_t                      m_xrgameMipDrop = 0u;
+
+    void XrGameReduce(
+            DxvkImageCreateInfo&  ImageInfo,
+            VkImageAspectFlags    Aspects);
 
     void CreateMappedBuffer(
             UINT                  Subresource);
